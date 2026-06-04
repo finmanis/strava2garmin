@@ -1,0 +1,129 @@
+name: Sync FORM swims to Garmin
+
+on:
+  # Run every 6 hours
+  schedule:
+    - cron: '0 */6 * * *'
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # State persistence strategy: GitHub Gist
+      # The Gist holds three files:
+      #   last_synced_id.txt        — last synced Strava activity ID
+      #   strava_refresh_token.txt  — current Strava refresh token (rotates on every use)
+      #   garmin_tokens.json        — garth OAuth token cache (avoids fresh login + MFA in CI)
+      # All are restored at the start of each run and patched back on success.
+      # Required secrets: GIST_ID, GH_PAT (Personal Access Token with "gist" scope)
+      - name: Restore state from Gist
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          STRAVA_REFRESH_TOKEN_FALLBACK: ${{ secrets.STRAVA_REFRESH_TOKEN }}
+          # ^^ fallback only used on first run before Gist has the token
+        run: |
+          gist=$(curl -s -H "Authorization: token $GH_PAT" \
+            "https://api.github.com/gists/$GIST_ID")
+
+          # Fail fast if the Gist API returned an error (bad GIST_ID or GH_PAT)
+          echo "$gist" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          if 'files' not in d:
+              print('Gist API error:', d.get('message', d))
+              sys.exit(1)
+          "
+
+          # Restore last_synced_id.txt (fall back to 0)
+          last_id=$(echo "$gist" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d['files'].get('last_synced_id.txt',{}).get('content','0') or '0')")
+          echo "$last_id" > last_synced_id.txt
+          echo "Restored last_synced_id: $last_id"
+
+          # Resolve Strava refresh token: prefer Gist (rotated value), fall back to secret (bootstrap)
+          token=$(echo "$gist" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d['files'].get('strava_refresh_token.txt',{}).get('content','') or '')" \
+            2>/dev/null || echo "")
+          if [ -z "$token" ]; then
+            token="$STRAVA_REFRESH_TOKEN_FALLBACK"
+            echo "No token in Gist — using STRAVA_REFRESH_TOKEN secret as bootstrap."
+          fi
+          echo "STRAVA_REFRESH_TOKEN=$token" >> "$GITHUB_ENV"
+
+          # Restore Garmin OAuth token cache
+          echo "$gist" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          content = d['files'].get('garmin_tokens.json', {}).get('content', '') or ''
+          if content:
+              with open('garmin_tokens.json', 'w') as f:
+                  f.write(content)
+              print('Restored garmin_tokens.json')
+          else:
+              print('No garmin_tokens.json in Gist — Garmin login will fail without cached tokens')
+          "
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Cache pip downloads keyed on requirements.txt to speed up subsequent runs
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          # Strava is moving the data API base to www.api-v3.strava.com (June 2026).
+          # The new host is not yet resolvable in DNS; sync.py defaults to the legacy base.
+          # Once `dig +short www.api-v3.strava.com` returns an IP, uncomment the line below.
+          # STRAVA_API_BASE: https://www.api-v3.strava.com
+        run: python sync.py
+
+      # Persist all state files back to the Gist after a successful run.
+      - name: Persist state to Gist
+        if: success()
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          last_id=$(cat last_synced_id.txt)
+          token=$(cat strava_refresh_token.txt)
+          payload=$(python3 -c "
+          import json, sys, os
+          files = {
+              'last_synced_id.txt': {'content': sys.argv[1]},
+              'strava_refresh_token.txt': {'content': sys.argv[2]},
+          }
+          if os.path.exists('garmin_tokens.json'):
+              with open('garmin_tokens.json') as f:
+                  files['garmin_tokens.json'] = {'content': f.read()}
+          print(json.dumps({'files': files}))
+          " "$last_id" "$token")
+          curl -s -X PATCH \
+            -H "Authorization: token $GH_PAT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "https://api.github.com/gists/$GIST_ID" > /dev/null
+          echo "Persisted last_synced_id: $last_id"
+          echo "Persisted updated Strava refresh token."
+          echo "Persisted Garmin OAuth tokens."
